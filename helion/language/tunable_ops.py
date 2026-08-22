@@ -178,7 +178,12 @@ def _register_tunable_type(
     python_type = type(fragment_val.default())
     if not issubclass(python_type, (int, float, bool)):
         raise exc.TunableTypeNotSupported(python_type)
-    return NumericType.subtype(python_type).new_unbacked(origin)
+    result = NumericType.subtype(python_type).new_unbacked(origin)
+    # Remember which symbols stand for this tunable so codegen can pass it to the
+    # kernel as constexpr rather than a runtime scalar (see DeviceFunction.expr_arg).
+    for symbol in result.value._sympy_().free_symbols:
+        env.tunable_symbols[symbol] = name_val
+    return result
 
 
 @_decorators.codegen(register_tunable, "common")

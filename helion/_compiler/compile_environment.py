@@ -315,6 +315,9 @@ class CompileEnvironment:
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[TensorPropertySource] = set()
+        # Symbols standing in for hl.register_tunable values, which are only
+        # concrete once a config is chosen at codegen time.
+        self.tunable_symbols: dict[sympy.Symbol, str] = {}
         self.tensor_descriptor_layout_guards: dict[
             Source, TensorDescriptorLayoutGuard
         ] = {}

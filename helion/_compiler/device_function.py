@@ -261,7 +261,7 @@ class DeviceFunction:
         self._tensor_descriptor_args: dict[
             tuple[torch.Tensor, str], TensorDescriptorArg
         ] = {}
-        self._expr_args: dict[sympy.Expr, SymbolArgument] = {}
+        self._expr_args: dict[sympy.Expr, NumericArgument] = {}
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._constexpr_host_defs: set[str] = set()
         self._scratch_args: list[ScratchArg] = []
@@ -723,9 +723,19 @@ class DeviceFunction:
             self._tensor_descriptor_args[key] = arg
         return self._tensor_descriptor_args[key]
 
-    def expr_arg(self, sym: sympy.Expr, origin: Origin) -> SymbolArgument:
+    def expr_arg(self, sym: sympy.Expr, origin: Origin) -> NumericArgument:
         if sym not in self._expr_args:
-            arg = SymbolArgument(
+            # hl.register_tunable values are constant for the config being
+            # compiled, so pass them as constexpr.  Otherwise a branch selected
+            # by a tunable stays dynamic and both sides are compiled, which costs
+            # registers (and occupancy) for code that never runs.
+            tunables = CompileEnvironment.current().tunable_symbols
+            arg_type = (
+                ConstExprArg
+                if sym.free_symbols and tunables.keys() >= sym.free_symbols
+                else SymbolArgument
+            )
+            arg = arg_type(
                 name=self.new_var(origin.suggest_var_name()),
                 _host_str=origin.host_str(),
             )

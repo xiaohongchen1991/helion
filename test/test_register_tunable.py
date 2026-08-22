@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from unittest.mock import patch
 
@@ -13,7 +14,9 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion.autotuner import BooleanFragment
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
 from helion.autotuner import PowerOfTwoFragment
@@ -158,6 +161,66 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
             ),
             PowerOfTwoFragment,
         )
+
+    @skipIfRefEager("compile_config not supported in ref eager mode")
+    def test_tunable_passed_as_constexpr(self):
+        """A tunable used on device is passed as constexpr, not a runtime scalar.
+
+        The value is constant for the config being compiled, so marking it
+        constexpr lets Triton drop the dead side of a branch that selects on it.
+        As a runtime scalar both sides get compiled instead: for a swap-AB GEMM
+        that keeps a second matmul alive, costing registers and occupancy for
+        code that never runs.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def matmul_swap_ab(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            M, K = a.size()
+            _, N = b.size()
+            out = torch.empty([M, N], dtype=a.dtype, device=a.device)
+            block_k = hl.register_block_size(K)
+            swap_ab = hl.register_tunable("swap_ab", BooleanFragment())
+            for tile_m, tile_n in hl.tile([M, N]):
+                if swap_ab:
+                    acc_swap = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+                    for tile_k in hl.tile(K, block_size=block_k):
+                        a_blk = hl.load(
+                            a, [tile_m.index[None, :], tile_k.index[:, None]]
+                        )
+                        b_blk = hl.load(
+                            b, [tile_k.index[None, :], tile_n.index[:, None]]
+                        )
+                        acc_swap = hl.dot(
+                            b_blk, a_blk, acc=acc_swap, out_dtype=torch.float32
+                        )
+                    out[tile_m, tile_n] = acc_swap.t().to(out.dtype)
+                else:
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                    for tile_k in hl.tile(K, block_size=block_k):
+                        acc = hl.dot(
+                            a[tile_m, tile_k],
+                            b[tile_k, tile_n],
+                            acc=acc,
+                            out_dtype=torch.float32,
+                        )
+                    out[tile_m, tile_n] = acc.to(out.dtype)
+            return out
+
+        M, K, N = 32, 256, 128
+        a = torch.randn(M, K, device=DEVICE, dtype=HALF_DTYPE)
+        b = torch.randn(K, N, device=DEVICE, dtype=HALF_DTYPE)
+        expected = a @ b
+
+        bound = matmul_swap_ab.bind((a, b))
+        for swap_ab in [True, False]:
+            config = helion.Config(block_sizes=[32, 64, 64], swap_ab=swap_ab)
+            code = bound.to_triton_code(config)
+            params = re.search(r"^def _helion_matmul_swap_ab\((.*)\):$", code, re.M)
+            assert params is not None
+            self.assertIn("swap_ab: tl.constexpr", params.group(1))
+            self.assertIn("if swap_ab:", code)
+            result = bound.compile_config(config)(a, b)
+            torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
